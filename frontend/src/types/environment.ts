@@ -2,6 +2,8 @@
  * 环境记录：某批次所在窖位的一次温湿度登记。
  * 温湿度越界自动标异常并给出开窗 / 加湿等调整措施。
  */
+import type { TempZone } from '@/types/shelf'
+
 export interface Environment {
   id: string
   /** 所属批次 id（外键 → Batch.id） */
@@ -12,7 +14,16 @@ export interface Environment {
   tempC: number
   /** 湿度 % */
   humidityPct: number
-  /** 是否异常（越界自动判定，也可人工修正） */
+  /** 判定时批次所在温区快照（按该温区的阈值版本判定，不随后续挪窖改变） */
+  zone: TempZone
+  /** 判定所引用的阈值版本 id（外键 → ThresholdVersion.id） */
+  thresholdVersionId: string
+  /**
+   * 结论是否已失效：阈值版本变化且新旧结论不一致时置为 true，
+   * 原 anomaly 结论保留不变，直到显式按新版本重算。
+   */
+  stale: boolean
+  /** 是否异常（按记录时的阈值版本自动判定，也可人工修正） */
   anomaly: boolean
   /** 调整措施，如「开窗通风 30 分钟」「加湿至 88%」 */
   action: string

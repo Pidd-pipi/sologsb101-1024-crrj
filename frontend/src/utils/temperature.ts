@@ -1,15 +1,22 @@
 import type { TempZone } from '@/types/shelf'
 import type { EnvSeriesPoint, Environment } from '@/types/environment'
+import type { ThresholdSettings, ThresholdVersion } from '@/types/threshold'
 
-/** 各温区的适宜温度区间（℃） */
-export const TEMP_RANGE: Record<TempZone, { min: number; max: number }> = {
-  冷区: { min: 4, max: 8 },
-  中温区: { min: 9, max: 13 },
-  常温区: { min: 14, max: 18 }
+/** 初始（v1）阈值：老数据升级与空库播种时补的初始阈值版本都取这一组 */
+export const INITIAL_THRESHOLD_SETTINGS: ThresholdSettings = {
+  tempRanges: {
+    冷区: { min: 4, max: 8 },
+    中温区: { min: 9, max: 13 },
+    常温区: { min: 14, max: 18 }
+  },
+  humidity: { min: 80, max: 92 }
 }
 
+/** 各温区的适宜温度区间（℃）——无版本数据时的兜底常量，业务判定优先用阈值版本 */
+export const TEMP_RANGE = INITIAL_THRESHOLD_SETTINGS.tempRanges
+
 /** 熟成库适宜湿度区间（%）：低于下限需加湿，高于上限需除湿通风 */
-export const HUMIDITY_RANGE = { min: 80, max: 92 }
+export const HUMIDITY_RANGE = INITIAL_THRESHOLD_SETTINGS.humidity
 
 /** 温区代表色，用于卡片与曲线 */
 export const ZONE_COLOR: Record<TempZone, string> = {
@@ -51,16 +58,21 @@ function judge(
 }
 
 /**
- * 温区阈值判定：温度按 `zone` 阈值、湿度按 HUMIDITY_RANGE 阈值，
+ * 阈值判定：温度按 `settings` 中 `zone` 的温度阈值、湿度按 `settings` 的湿度阈值，
  * 任一越界即 ok = false，并给出开窗 / 加湿等调整建议。
  */
-export function judgeEnvironment(tempC: number, humidityPct: number, zone: TempZone): RangeVerdict {
-  const range = TEMP_RANGE[zone]
+export function judgeEnvironment(
+  tempC: number,
+  humidityPct: number,
+  zone: TempZone,
+  settings: ThresholdSettings = INITIAL_THRESHOLD_SETTINGS
+): RangeVerdict {
+  const range = settings.tempRanges[zone]
   const tempIssue = judge(tempC, range.min, range.max, '℃', `${zone}温度偏低`, `${zone}温度偏高`)
   const humidityIssue = judge(
     humidityPct,
-    HUMIDITY_RANGE.min,
-    HUMIDITY_RANGE.max,
+    settings.humidity.min,
+    settings.humidity.max,
     '%',
     '湿度过低',
     '湿度过高'
@@ -74,7 +86,7 @@ export function judgeEnvironment(tempC: number, humidityPct: number, zone: TempZ
   }
   if (humidityIssue) {
     reasons.push(humidityIssue)
-    suggestions.push(humidityPct < HUMIDITY_RANGE.min ? '开启加湿器并覆盖湿布' : '开窗排湿或开启除湿机')
+    suggestions.push(humidityPct < settings.humidity.min ? '开启加湿器并覆盖湿布' : '开窗排湿或开启除湿机')
   }
 
   return {
@@ -86,23 +98,47 @@ export function judgeEnvironment(tempC: number, humidityPct: number, zone: TempZ
   }
 }
 
+/** 按指定阈值版本判定；版本缺失时回落到初始阈值 */
+export function judgeByVersion(
+  tempC: number,
+  humidityPct: number,
+  zone: TempZone,
+  version: ThresholdVersion | null | undefined
+): RangeVerdict {
+  return judgeEnvironment(tempC, humidityPct, zone, version ?? INITIAL_THRESHOLD_SETTINGS)
+}
+
 /** 越界自动标异常：任一温湿度越界即为异常 */
-export function isAnomaly(tempC: number, humidityPct: number, zone: TempZone): boolean {
-  return !judgeEnvironment(tempC, humidityPct, zone).ok
+export function isAnomaly(
+  tempC: number,
+  humidityPct: number,
+  zone: TempZone,
+  settings?: ThresholdSettings
+): boolean {
+  return !judgeEnvironment(tempC, humidityPct, zone, settings).ok
 }
 
 /** 异常记录的默认调整措施文案，写入表单初值 */
-export function suggestAction(tempC: number, humidityPct: number, zone: TempZone): string {
-  const verdict = judgeEnvironment(tempC, humidityPct, zone)
+export function suggestAction(
+  tempC: number,
+  humidityPct: number,
+  zone: TempZone,
+  settings?: ThresholdSettings
+): string {
+  const verdict = judgeEnvironment(tempC, humidityPct, zone, settings)
   if (verdict.ok) return ''
   return verdict.suggestion
 }
 
-/** 温湿度越界标记换算：按批次所在温区批量判定一组记录 */
-export function markAnomalies(records: Environment[], zoneOf: (batchId: string) => TempZone): number {
+/** 温湿度越界标记换算：按调用方给出的阈值解析器批量判定一组记录 */
+export function markAnomalies(
+  records: Environment[],
+  resolve: (record: Environment) => { zone: TempZone; settings: ThresholdSettings }
+): number {
   let changed = 0
   records.forEach((record) => {
-    const expected = isAnomaly(record.tempC, record.humidityPct, zoneOf(record.batchId))
+    const { zone, settings } = resolve(record)
+    const expected = isAnomaly(record.tempC, record.humidityPct, zone, settings)
     if (record.anomaly !== expected) changed += 1
   })
   return changed

@@ -6,6 +6,9 @@ import { useMilkStore } from '@/stores/milkStore'
 import { useShelfStore } from '@/stores/shelfStore'
 import { useTastingStore } from '@/stores/tastingStore'
 import { useTurningStore } from '@/stores/turningStore'
+import { useDataVersion } from '@/hooks/useDataVersion'
+
+useDataVersion()
 
 const route = useRoute()
 const router = useRouter()

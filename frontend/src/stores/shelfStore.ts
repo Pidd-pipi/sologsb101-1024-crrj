@@ -202,7 +202,8 @@ export const useShelfStore = defineStore('shelf', () => {
 
     const previousShelfId = batch.shelfId
     const now = Date.now()
-    await db.transaction('rw', [db.shelves, db.batches], async () => {
+    // 批次迁到新窖位后，尚未完成的转架作业改指新窖位；已完成 / 已跳过的作业保留原位置
+    const repointed = await db.transaction('rw', [db.shelves, db.batches, db.turnings], async () => {
       if (previousShelfId) {
         const previous = await db.shelves.get(previousShelfId)
         if (previous) {
@@ -227,14 +228,25 @@ export const useShelfStore = defineStore('shelf', () => {
         state: batch.state === '凝乳' ? '熟成中' : batch.state,
         updatedAt: now
       })
+      const pending = await db.turnings
+        .where('batchId')
+        .equals(batchId)
+        .and((turning) => turning.state === '待执行')
+        .toArray()
+      for (const turning of pending) {
+        if (turning.shelfId !== shelfId) {
+          await db.turnings.update(turning.id, { shelfId: shelfId, updatedAt: now })
+        }
+      }
+      return pending.length
     })
 
+    const location = `${shelf.room} ${shelf.rackNo} 第 ${shelf.layerNo} 层`
     return {
       ok: true,
-      message: `已上架至 ${shelf.room} ${shelf.rackNo} 第 ${shelf.layerNo} 层（${Math.min(
-        live.capacity,
-        occupiedNow + 1
-      )}/${live.capacity}）`
+      message:
+        `已上架至 ${location}（${Math.min(live.capacity, occupiedNow + 1)}/${live.capacity}）` +
+        (repointed > 0 ? `，${repointed} 条待执行转架作业已改指新窖位` : '')
     }
   }
 

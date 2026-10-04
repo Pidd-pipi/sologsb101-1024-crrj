@@ -42,9 +42,9 @@ docker compose up -d --build      # 代码改动后重新构建
 | 语言 | TypeScript（`strict: true`、`noUnusedLocals: true`） | `npm run build` 内含 `vue-tsc --noEmit` 类型检查，0 错误 |
 | UI 组件库 | Element Plus 2.x（含 `@element-plus/icons-vue`） | 表格、表单、对话框、进度条、滑块、标签 |
 | 构建工具 | Vite 6 | 开发服务器端口 22824 |
-| 状态管理 | Pinia（setup store） | `milkStore` / `shelfStore` / `turningStore` / `tastingStore` |
+| 状态管理 | Pinia（setup store） | `milkStore` / `shelfStore` / `turningStore` / `tastingStore` / `thresholdStore` |
 | 路由 | Vue Router 4（history 模式） | nginx 侧配合 `try_files` 做 SPA fallback |
-| 本地存储 | Dexie 4（IndexedDB 封装）+ localStorage | 库名 `gbcheeseage`，结构版本 `DB_VERSION = 2`，含真实 `.upgrade()` 迁移 |
+| 本地存储 | Dexie 4（IndexedDB 封装）+ localStorage | 库名 `gbcheeseage`，结构版本 `DB_VERSION = 3`，含真实 `.upgrade()` 迁移 |
 | 图表 | 手写 SVG 折线（无额外依赖） | 温湿度双曲线 + 越界点标记 |
 | 拖拽排序 | HTML5 原生 `draggable` 事件 | 未引入 `vuedraggable` / `dnd-kit` 等任何新依赖 |
 | 容器化 | Docker 多阶段构建：`node:20-alpine` → `nginx:alpine` | 构建阶段执行类型检查与打包，运行阶段仅托管静态产物 |
@@ -82,10 +82,10 @@ sologsb101-1024/
     ├── tsconfig.json / vite.config.ts / index.html
     ├── public/favicon.svg
     └── src/
-        ├── types/                # milk.ts batch.ts shelf.ts turning.ts environment.ts tasting.ts
-        ├── stores/               # milkStore.ts shelfStore.ts turningStore.ts tastingStore.ts
+        ├── types/                # milk.ts batch.ts shelf.ts turning.ts environment.ts tasting.ts threshold.ts meta.ts
+        ├── stores/               # milkStore.ts shelfStore.ts turningStore.ts tastingStore.ts thresholdStore.ts
         ├── components/common/    # GradeTag.vue FilterBar.vue StatBadge.vue EmptyPanel.vue
-        ├── hooks/                # useAgingDays.ts useIdbTable.ts
+        ├── hooks/                # useAgingDays.ts useIdbTable.ts useDataVersion.ts
         ├── pages/                # MilkList.vue ShelfBoard.vue TurningPlan.vue EnvironmentView.vue TastingBoard.vue
         ├── router/index.ts       # 路由表 + 懒加载 + document.title
         ├── utils/                # temperature.ts db.ts export.ts
@@ -98,7 +98,7 @@ sologsb101-1024/
 | `/milk` | 奶源与批次台账 | 新建奶源与批次，按乳种 / 批次状态筛选并同步 URL query；按目标熟成天数自动算最早可出库日期；状态流转「凝乳 → 熟成中 → 已出库 / 报废」；级联删除奶源与批次 | Milk、Batch |
 | `/shelves` | 熟成库货架与窖位 | 库房 / 货架号 / 层号 / 温区 / 可放块数维护，占用率卡片与进度条；上架时按余量硬校验并实时更新 `occupied`；下架释放余量 | Shelf、Batch |
 | `/turnings` | 转架 / 翻面 / 擦洗作业 | 按批次生成等间隔计划（起始日 + 间隔天数 × 次数）；逐条签署「待执行 → 已完成 / 已跳过」；HTML5 原生拖拽调整同批次内顺序并写回 `seq` | Turning、Batch、Shelf |
-| `/environment` | 温湿度记录与曲线 | 按温区阈值自动判定越界并标异常，提示开窗 / 加湿措施；手写 SVG 温湿度双曲线 + 越界点；一键重算异常标记 | Environment、Batch、Shelf |
+| `/environment` | 温湿度记录与曲线 | 温湿度按**阈值版本**判定（每季度调整发布新版本，不覆盖旧版本）：新记录按当时生效版本判定，旧记录保留原异常结论，版本变化后结论反转的记录标「待重算」，手动重算才切换；批次迁移新窖位后待执行转架自动改指新位；手写 SVG 双曲线 + 越界点 | Environment、Batch、Shelf、ThresholdVersion |
 | `/tastings` | 出库品评与档案导出 | 外观 / 风味 / 质地三维打分，同批次均分回写批次结论；JSON 全量导出导入（覆盖 / 追加两种模式）、单批次档案导出、重置并重新播种 | Tasting 及全部模型 |
 
 `/` 与未匹配路径均重定向到 `/milk`；页面组件全部懒加载，`router.afterEach` 统一设置 `document.title`。
@@ -108,10 +108,11 @@ sologsb101-1024/
 ## 五、IndexedDB 与数据存储说明
 
 - **数据库名**：`gbcheeseage`（Dexie 实例定义在 `frontend/src/utils/db.ts`）。
-- **结构版本**：`DB_VERSION = 2`。
+- **结构版本**：`DB_VERSION = 3`。
   - `version(1)`：初版六张业务表与索引。
   - `version(2).stores(...).upgrade(async (tx) => {...})`：**真实迁移**——为 `batches` 补齐 `shelfId` / `conclusion` / 时间戳；按作业日期为历史 `turnings` 回填 `seq` 执行序号；把湿度越界的 `environments` 记录重算为异常并补默认措施；把 `shelves` 的负数容量与占用数归零。
-- **六张表**：
+  - `version(3).stores(...).upgrade(async (tx) => {...})`：**阈值版本化迁移**——新增 `thresholdVersions` / `app_meta` 两张表；补一条固定 id 为 `threshold_v1` 的初始阈值版本（旧记录判定口径全部锚定到该版本）；为历史环境记录按「批次 → 窖位」回填 `zone` 温区快照、`thresholdVersionId` 引用与 `stale = false`；补 `app_meta` 单例行（`dataVersion = 1`）。
+- **八张表**：
 
 | 表 | 模型 | 关键字段 | 索引 |
 | --- | --- | --- | --- |
@@ -119,12 +120,20 @@ sologsb101-1024/
 | `batches` | Batch 生产批次 | `milkId` `curdedAt` `cheeseType`(硬质/软质/蓝纹/洗皮) `targetDays` `weightKg` `state` `shelfId` `conclusion` | id, milkId, shelfId, cheeseType, state, curdedAt |
 | `shelves` | Shelf 窖位 | `room` `rackNo` `layerNo` `tempZone`(冷区/中温区/常温区) `capacity` `occupied` | id, room, rackNo, tempZone, occupied |
 | `turnings` | Turning 转架作业 | `batchId` `shelfId` `doneAt` `type`(转架/翻面/擦洗) `brinePct` `operator` `state` `seq` | id, batchId, shelfId, doneAt, type, state, seq |
-| `environments` | Environment 环境记录 | `batchId` `recordedAt` `tempC` `humidityPct` `anomaly` `action` | id, batchId, recordedAt, anomaly |
+| `environments` | Environment 环境记录 | `batchId` `recordedAt` `tempC` `humidityPct` `zone`(温区快照) `thresholdVersionId`(判定版本) `stale`(结论失效待重算) `anomaly` `action` | id, batchId, recordedAt, anomaly, stale, thresholdVersionId |
 | `tastings` | Tasting 品评 | `batchId` `outAt` `appearance/flavor/texture` 描述 + 三维评分 `score` `conclusion` `taster` | id, batchId, outAt, score, conclusion |
+| `thresholdVersions` | ThresholdVersion 阈值版本 | `label` `effectiveAt` `isActive`(唯一生效) 三温区 `tempRanges` + `humidity` `note` | id, effectiveAt |
+| `app_meta` | AppMeta 单例元数据 | 固定一行 `id = singleton`，`dataVersion` 数据修订号 | id |
 
 - **首屏自动播种**：`initDatabase()` 在 `db.open()` 后执行 `if ((await db.milks.count()) === 0) { await seedDatabase() }`，播种 3 层互相引用的演示数据（奶源 3 → 生产批次 4 → 转架 4 / 环境 4 / 品评 3），使用固定 id + `bulkPut`，**幂等**（重复调用不会产生重复记录）。
 - **localStorage**：仅存元数据 —— `gbcheeseage:db-version`（本地结构版本）、`gbcheeseage:last-backup-at`（最近一次导出时间）、`gbcheeseage:ui-prefs`（当前库房、作业排序方式、曲线指标）。
-- **导出 / 导入**：`frontend/src/utils/export.ts` 提供 `exportSnapshotJson()`（全量）、`exportBatchArchiveJson(batchId)`（单批次档案）与 `parseSnapshotJson()` 校验（校验 `app` 字段、各集合数组、父子引用完整性，失败抛出原因且不写入任何数据）；`/tastings` 页支持「覆盖导入」与「追加导入（重新分配 id）」。
+- **导出 / 导入**：`frontend/src/utils/export.ts` 提供 `exportSnapshotJson()`（全量）、`exportBatchArchiveJson(batchId)`（单批次档案）与 `parseSnapshotJson()` 校验（校验 `app` 字段、各集合数组、父子引用完整性，失败抛出原因且不写入任何数据）；`/tastings` 页支持「覆盖导入」与「追加导入（重新分配 id）」。两种导出都携带 `thresholdVersions`（单批次档案只带环境记录引用到的版本）；旧版备份无该字段时校验阶段补一份 `threshold_v1` 初始版本，覆盖导入保证恰有一个生效版本，追加导入把外来版本作为历史参照并保留本地生效版本。
+- **阈值版本语义（温湿度判定的时间维度）**：
+  - **新记录按当时版本判定**：环境记录保存时写入 `zone`（判定温区快照，不随后续挪窖改变）、`thresholdVersionId`（判定版本引用）与 `anomaly` 结论。
+  - **旧记录保留原异常结论**：在 `/environment` 页「温区阈值版本」对话框发布新版本时，旧版本失活、新版本生效；逐条预演后，新旧判定结论一致的记录直接迁移版本引用，结论会反转的记录**不改 `anomaly`**，只置 `stale = true`（列表与顶部提示「待重算」）。
+  - **失效后显式重算**：「重算失效记录」只处理 `stale` 记录，「全部重算」按当前版本对齐全部记录；重算后结论才切换、引用迁移到新版本。
+  - **批次迁移窖位**：`shelfStore.assignBatch()` 在同一事务内把该批次 `state = 待执行` 的转架作业 `shelfId` 改指新窖位；`已完成 / 已跳过` 的作业保留原位置，作为历史发生地留档。
+  - **多标签页并发保护**：`app_meta.dataVersion` 是全局修订号，发布阈值版本 / 覆盖导入 / 重置后 +1；`useDataVersion()`（挂在 `App.vue`）订阅到其它标签页推进修订号时弹窗提示「重新载入」；发布阈值版本时还会比对打开对话框时的修订号，过期页面保存直接抛 `StaleDataVersionError` 并提示重新载入，不能覆盖先提交的版本。
 - **隐私与无状态**：数据不上传任何服务器，容器不挂载命名卷；清理浏览器站点数据或更换浏览器会丢失档案，请定期导出备份。
 
 ---

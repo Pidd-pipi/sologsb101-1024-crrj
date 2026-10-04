@@ -3,10 +3,15 @@ import {
   DB_VERSION,
   createId,
   clearAllTables,
-  stampBackupTime,
+  bumpDataVersion,
+  ensureInitialThresholdVersion,
+  INITIAL_THRESHOLD_VERSION_ID,
   type BackupPayload,
   type BatchArchive
 } from '@/utils/db'
+import type { Environment } from '@/types/environment'
+import type { ThresholdVersion } from '@/types/threshold'
+import { INITIAL_THRESHOLD_SETTINGS } from '@/utils/temperature'
 
 /** 导入 / 校验结果：校验失败时 errors 非空、payload 为 null */
 export interface ParseResult {
@@ -28,6 +33,41 @@ function isPlainObject(input: unknown): input is Record<string, unknown> {
   return typeof input === 'object' && input !== null && !Array.isArray(input)
 }
 
+function isFiniteNumber(input: unknown): input is number {
+  return typeof input === 'number' && Number.isFinite(input)
+}
+
+/** 校验并规整一条阈值版本，非法时返回 null */
+function normalizeThresholdVersion(input: unknown, now: number): ThresholdVersion | null {
+  if (!isPlainObject(input) || typeof input.id !== 'string') return null
+  const tempRanges = isPlainObject(input.tempRanges) ? input.tempRanges : {}
+  const humidity = isPlainObject(input.humidity) ? input.humidity : {}
+  const zones = ['冷区', '中温区', '常温区'] as const
+  const ranges = {} as ThresholdVersion['tempRanges']
+  let valid = true
+  zones.forEach((zone) => {
+    const range = tempRanges[zone]
+    if (!isPlainObject(range) || !isFiniteNumber(range.min) || !isFiniteNumber(range.max)) {
+      valid = false
+      return
+    }
+    ranges[zone] = { min: range.min, max: range.max }
+  })
+  if (!valid) return null
+  if (!isFiniteNumber(humidity.min) || !isFiniteNumber(humidity.max)) return null
+  return {
+    id: input.id,
+    label: typeof input.label === 'string' && input.label.trim() ? input.label : '导入的阈值版本',
+    effectiveAt: typeof input.effectiveAt === 'string' ? input.effectiveAt.slice(0, 10) : '2025-01-01',
+    isActive: input.isActive === true,
+    note: typeof input.note === 'string' ? input.note : '',
+    tempRanges: ranges,
+    humidity: { min: humidity.min, max: humidity.max },
+    createdAt: isFiniteNumber(input.createdAt) ? input.createdAt : now,
+    updatedAt: isFiniteNumber(input.updatedAt) ? input.updatedAt : now
+  }
+}
+
 /**
  * 校验批次熟成档案 JSON 的必备字段，返回错误信息数组（为空表示通过）。
  * 同时剔除非法条目，保证导入的数据结构完整。
@@ -46,6 +86,24 @@ export function validatePayload(input: unknown): ParseResult {
   if (errors.length > 0) return { ok: false, errors, payload: null }
 
   const obj = input as Partial<BackupPayload>
+  const now = Date.now()
+  // 阈值版本：老备份可能没有该字段，校验阶段先补一份初始版本，写入前还会与本地合并
+  const rawVersions = Array.isArray(obj.thresholdVersions) ? obj.thresholdVersions : []
+  const thresholdVersions = rawVersions
+    .map((item) => normalizeThresholdVersion(item, now))
+    .filter((item): item is ThresholdVersion => item !== null)
+  if (thresholdVersions.length === 0) {
+    thresholdVersions.push({
+      ...INITIAL_THRESHOLD_SETTINGS,
+      id: INITIAL_THRESHOLD_VERSION_ID,
+      label: '初始温湿度阈值',
+      effectiveAt: '2025-01-01',
+      isActive: true,
+      note: '旧版备份导入时补建的初始阈值版本',
+      createdAt: now,
+      updatedAt: now
+    })
+  }
   const payload: BackupPayload = {
     app: 'gbcheeseage',
     dbVersion: typeof obj.dbVersion === 'number' ? obj.dbVersion : DB_VERSION,
@@ -55,7 +113,8 @@ export function validatePayload(input: unknown): ParseResult {
     shelves: (obj.shelves ?? []).filter((item) => typeof item?.id === 'string'),
     turnings: (obj.turnings ?? []).filter((item) => typeof item?.id === 'string'),
     environments: (obj.environments ?? []).filter((item) => typeof item?.id === 'string'),
-    tastings: (obj.tastings ?? []).filter((item) => typeof item?.id === 'string')
+    tastings: (obj.tastings ?? []).filter((item) => typeof item?.id === 'string'),
+    thresholdVersions
   }
   if (payload.batches.length === 0 && payload.milks.length === 0) {
     errors.push('文件中没有任何奶源或批次记录')
@@ -126,13 +185,14 @@ function stamp(): string {
 
 /** 导出全量档案 JSON */
 export async function exportSnapshotJson(): Promise<{ fileName: string; counts: Record<string, number> }> {
-  const [milks, batches, shelves, turnings, environments, tastings] = await Promise.all([
+  const [milks, batches, shelves, turnings, environments, tastings, thresholdVersions] = await Promise.all([
     db.milks.toArray(),
     db.batches.toArray(),
     db.shelves.toArray(),
     db.turnings.toArray(),
     db.environments.toArray(),
-    db.tastings.toArray()
+    db.tastings.toArray(),
+    db.thresholdVersions.toArray()
   ])
   const payload: BackupPayload = {
     app: 'gbcheeseage',
@@ -143,11 +203,11 @@ export async function exportSnapshotJson(): Promise<{ fileName: string; counts: 
     shelves,
     turnings,
     environments,
-    tastings
+    tastings,
+    thresholdVersions
   }
   const fileName = `gbcheeseage-archive-v${DB_VERSION}-${stamp()}.json`
   downloadJson(fileName, payload)
-  stampBackupTime(payload.exportedAt)
   return {
     fileName,
     counts: {
@@ -156,7 +216,8 @@ export async function exportSnapshotJson(): Promise<{ fileName: string; counts: 
       shelves: shelves.length,
       turnings: turnings.length,
       environments: environments.length,
-      tastings: tastings.length
+      tastings: tastings.length,
+      thresholdVersions: thresholdVersions.length
     }
   }
 }
@@ -167,13 +228,17 @@ export async function exportBatchArchiveJson(
 ): Promise<{ fileName: string; counts: Record<string, number> }> {
   const batch = await db.batches.get(batchId)
   if (!batch) throw new Error('批次不存在，无法导出')
-  const [milks, shelves, turnings, environments, tastings] = await Promise.all([
+  const [milks, shelves, turnings, environments, tastings, thresholdVersions] = await Promise.all([
     db.milks.toArray(),
     db.shelves.toArray(),
     db.turnings.where('batchId').equals(batchId).toArray(),
     db.environments.where('batchId').equals(batchId).toArray(),
-    db.tastings.where('batchId').equals(batchId).toArray()
+    db.tastings.where('batchId').equals(batchId).toArray(),
+    db.thresholdVersions.toArray()
   ])
+  // 只带回环境记录实际引用到的阈值版本，保证旧结论可按原口径还原
+  const referencedVersionIds = new Set(environments.map((record) => record.thresholdVersionId))
+  const batchVersions = thresholdVersions.filter((version) => referencedVersionIds.has(version.id))
   const archive: BatchArchive = {
     app: 'gbcheeseage',
     dbVersion: DB_VERSION,
@@ -185,7 +250,8 @@ export async function exportBatchArchiveJson(
     shelves: shelves.filter((shelf) => shelf.id === batch.shelfId),
     turnings,
     environments,
-    tastings
+    tastings,
+    thresholdVersions: batchVersions
   }
   const fileName = `gbcheeseage-batch-${batchId}-${stamp()}.json`
   downloadJson(fileName, archive)
@@ -197,9 +263,54 @@ export async function exportBatchArchiveJson(
       shelves: archive.shelves.length,
       turnings: turnings.length,
       environments: environments.length,
-      tastings: tastings.length
+      tastings: tastings.length,
+      thresholdVersions: batchVersions.length
     }
   }
+}
+
+/**
+ * 导入后合并阈值版本与环境记录引用：
+ * - 覆盖模式：以导入文件为准，保证恰有一个生效版本，环境记录引用落到文件内版本（兜底初始版本）；
+ * - 追加模式：保留本地生效版本，导入版本作为历史参照（全部置为非生效），
+ *   环境记录引用优先用本地已有版本，其次文件内版本，最后落到本地生效 / 初始版本。
+ */
+async function reconcileThresholds(payload: BackupPayload, overwrite: boolean): Promise<void> {
+  await ensureInitialThresholdVersion()
+  const localVersions = await db.thresholdVersions.toArray()
+  const localActive = localVersions.find((version) => version.isActive) ?? localVersions[0] ?? null
+  const now = Date.now()
+
+  if (overwrite) {
+    // 以导入文件为准：先全部置为非生效，再挑出文件里标记生效的版本（缺失则取第一条）
+    const versions = payload.thresholdVersions.map((version) => ({ ...version, isActive: false }))
+    const activeById = new Set(
+      payload.thresholdVersions.filter((version) => version.isActive).map((version) => version.id)
+    )
+    const active = versions.find((version) => activeById.has(version.id)) ?? versions[0]
+    if (active) active.isActive = true
+    await db.thresholdVersions.bulkPut(versions)
+    const versionIds = new Set(versions.map((version) => version.id))
+    await db.environments.toCollection().modify((record) => {
+      if (!record.thresholdVersionId || !versionIds.has(record.thresholdVersionId)) {
+        record.thresholdVersionId = active?.id ?? INITIAL_THRESHOLD_VERSION_ID
+      }
+    })
+    return
+  }
+
+  // 追加模式：导入版本作为历史参照，同 id 不覆盖本地，全部置为非生效
+  const localIds = new Set(localVersions.map((version) => version.id))
+  const imported = payload.thresholdVersions
+    .filter((version) => !localIds.has(version.id))
+    .map((version) => ({ ...version, isActive: false, updatedAt: now }))
+  if (imported.length > 0) await db.thresholdVersions.bulkPut(imported)
+  const importedIds = new Set(imported.map((version) => version.id))
+  await db.environments.toCollection().modify((record) => {
+    if (localIds.has(record.thresholdVersionId)) return
+    if (importedIds.has(record.thresholdVersionId)) return
+    record.thresholdVersionId = localActive?.id ?? INITIAL_THRESHOLD_VERSION_ID
+  })
 }
 
 /** 导入档案：overwrite 为 true 时先清空全部表，否则按 id 合并覆盖 */
@@ -210,8 +321,9 @@ export async function importSnapshotJson(
   if (overwrite) await clearAllTables()
   await db.transaction(
     'rw',
-    [db.milks, db.batches, db.shelves, db.turnings, db.environments, db.tastings],
+    [db.milks, db.batches, db.shelves, db.turnings, db.environments, db.tastings, db.thresholdVersions],
     async () => {
+      await db.thresholdVersions.bulkPut(payload.thresholdVersions)
       await db.milks.bulkPut(payload.milks)
       await db.batches.bulkPut(payload.batches)
       await db.shelves.bulkPut(payload.shelves)
@@ -220,13 +332,16 @@ export async function importSnapshotJson(
       await db.tastings.bulkPut(payload.tastings)
     }
   )
+  await reconcileThresholds(payload, overwrite)
+  if (overwrite) await bumpDataVersion()
   return {
     milks: payload.milks.length,
     batches: payload.batches.length,
     shelves: payload.shelves.length,
     turnings: payload.turnings.length,
     environments: payload.environments.length,
-    tastings: payload.tastings.length
+    tastings: payload.tastings.length,
+    thresholdVersions: payload.thresholdVersions.length
   }
 }
 
@@ -262,7 +377,7 @@ export function remapPayloadIds(payload: BackupPayload): BackupPayload {
     batchId: batchIdMap.get(turning.batchId) ?? turning.batchId,
     shelfId: shelfIdMap.get(turning.shelfId) ?? turning.shelfId
   }))
-  const environments = payload.environments.map((record) => ({
+  const environments: Environment[] = payload.environments.map((record) => ({
     ...record,
     id: createId('env'),
     batchId: batchIdMap.get(record.batchId) ?? record.batchId
@@ -272,6 +387,8 @@ export function remapPayloadIds(payload: BackupPayload): BackupPayload {
     id: createId('tast'),
     batchId: batchIdMap.get(tasting.batchId) ?? tasting.batchId
   }))
+  // 阈值版本 id 保持不变：作为历史判定口径被环境记录引用，导入后由 reconcileThresholds 与本地合并
+  const thresholdVersions = payload.thresholdVersions.map((version) => ({ ...version, isActive: false }))
 
-  return { ...payload, milks, batches, shelves, turnings, environments, tastings }
+  return { ...payload, milks, batches, shelves, turnings, environments, tastings, thresholdVersions }
 }

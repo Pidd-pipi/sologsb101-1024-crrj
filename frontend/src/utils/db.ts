@@ -5,13 +5,19 @@ import type { Shelf } from '@/types/shelf'
 import type { Turning } from '@/types/turning'
 import type { Environment } from '@/types/environment'
 import type { Tasting } from '@/types/tasting'
+import type { ThresholdVersion } from '@/types/threshold'
+import { APP_META_ID, type AppMeta } from '@/types/meta'
+import { INITIAL_THRESHOLD_SETTINGS } from '@/utils/temperature'
 import { addDays, diffDays } from '@/utils/temperature'
 
 /** IndexedDB 数据库名：与项目英文短名保持一致 */
 export const DB_NAME = 'gbcheeseage'
 
 /** 本地结构版本号：新增/修改表结构时必须递增，并补充 upgrade 迁移 */
-export const DB_VERSION = 2
+export const DB_VERSION = 3
+
+/** 初始阈值版本的固定主键：空库播种、v2→v3 升级与导入兜底共用 */
+export const INITIAL_THRESHOLD_VERSION_ID = 'threshold_v1'
 
 /** localStorage 键名（仅存少量元数据，业务数据一律在 IndexedDB） */
 export const LS_KEYS = {
@@ -46,6 +52,8 @@ export interface BackupPayload {
   turnings: Turning[]
   environments: Environment[]
   tastings: Tasting[]
+  /** 阈值版本（历史环境记录需要靠它还原判定口径） */
+  thresholdVersions: ThresholdVersion[]
 }
 
 /** 导出的批次熟成档案：含批次、奶源、窖位与全部子记录 */
@@ -61,6 +69,8 @@ export interface BatchArchive {
   turnings: Turning[]
   environments: Environment[]
   tastings: Tasting[]
+  /** 档案内环境记录引用到的阈值版本 */
+  thresholdVersions: ThresholdVersion[]
 }
 
 export class CheeseAgeDatabase extends Dexie {
@@ -70,6 +80,8 @@ export class CheeseAgeDatabase extends Dexie {
   turnings!: Table<Turning, string>
   environments!: Table<Environment, string>
   tastings!: Table<Tasting, string>
+  thresholdVersions!: Table<ThresholdVersion, string>
+  appMeta!: Table<AppMeta, string>
 
   constructor() {
     super(DB_NAME)
@@ -83,7 +95,7 @@ export class CheeseAgeDatabase extends Dexie {
       tastings: 'id, batchId, outAt, score, conclusion, updatedAt'
     })
     // v2：批次补 shelfId 索引与 conclusion 字段；转架表补 seq 排序索引；环境表补温区越界阈值快照
-    this.version(DB_VERSION)
+    this.version(2)
       .stores({
         milks: 'id, farm, milkKind, collectedAt, updatedAt',
         batches: 'id, milkId, shelfId, cheeseType, targetDays, state, curdedAt, updatedAt',
@@ -143,6 +155,57 @@ export class CheeseAgeDatabase extends Dexie {
             if (!Number.isFinite(shelf.occupied) || shelf.occupied < 0) shelf.occupied = 0
           })
       })
+    // v3：阈值版本表 + 应用元数据表；环境记录补温区快照、阈值版本引用与失效标记
+    this.version(DB_VERSION)
+      .stores({
+        milks: 'id, farm, milkKind, collectedAt, updatedAt',
+        batches: 'id, milkId, shelfId, cheeseType, targetDays, state, curdedAt, updatedAt',
+        shelves: 'id, room, rackNo, tempZone, capacity, occupied, updatedAt',
+        turnings: 'id, batchId, shelfId, doneAt, type, state, seq, updatedAt',
+        environments: 'id, batchId, recordedAt, anomaly, stale, thresholdVersionId, updatedAt',
+        tastings: 'id, batchId, outAt, score, conclusion, updatedAt',
+        thresholdVersions: 'id, effectiveAt, updatedAt',
+        appMeta: 'id'
+      })
+      .upgrade(async (tx) => {
+        const now = Date.now()
+        // 迁移 5：补初始阈值版本（旧库所有历史记录的判定口径都锚定到这一版）
+        const initialVersion: ThresholdVersion = {
+          ...INITIAL_THRESHOLD_SETTINGS,
+          id: INITIAL_THRESHOLD_VERSION_ID,
+          label: '初始温湿度阈值',
+          effectiveAt: '2025-01-01',
+          isActive: true,
+          note: '旧数据升级时补建的初始阈值版本',
+          createdAt: now,
+          updatedAt: now
+        }
+        await tx.table<ThresholdVersion>('thresholdVersions').put(initialVersion)
+
+        // 迁移 6：历史环境记录补判定快照（温区 + 阈值版本引用），原异常结论保留且视为仍有效
+        const batches = await tx.table<Batch>('batches').toArray()
+        const shelves = await tx.table<Shelf>('shelves').toArray()
+        const shelfZone = new Map(shelves.map((shelf) => [shelf.id, shelf.tempZone]))
+        const batchZone = new Map(
+          batches.map((batch) => [batch.id, batch.shelfId ? shelfZone.get(batch.shelfId) : undefined])
+        )
+        await tx
+          .table<Environment>('environments')
+          .toCollection()
+          .modify((record) => {
+            if (typeof record.zone !== 'string') {
+              record.zone = batchZone.get(record.batchId) ?? '中温区'
+            }
+            if (typeof record.thresholdVersionId !== 'string') {
+              record.thresholdVersionId = INITIAL_THRESHOLD_VERSION_ID
+            }
+            if (typeof record.stale !== 'boolean') record.stale = false
+          })
+
+        // 迁移 7：补应用级单例元数据
+        const meta: AppMeta = { id: APP_META_ID, dataVersion: 1, updatedAt: now }
+        await tx.table<AppMeta>('appMeta').put(meta)
+      })
   }
 }
 
@@ -154,11 +217,19 @@ export function createId(prefix: string): string {
   return `${prefix}_${Date.now().toString(36)}${rand}`
 }
 
-/** 清空全部业务表（导入前覆盖 / 重置数据使用） */
+/** 清空全部业务表（导入前覆盖 / 重置数据使用；阈值版本与元数据不属于业务表） */
 export async function clearAllTables(): Promise<void> {
   await db.transaction(
     'rw',
-    [db.milks, db.batches, db.shelves, db.turnings, db.environments, db.tastings],
+    [
+      db.milks,
+      db.batches,
+      db.shelves,
+      db.turnings,
+      db.environments,
+      db.tastings,
+      db.thresholdVersions
+    ],
     async () => {
       await Promise.all([
         db.milks.clear(),
@@ -166,29 +237,78 @@ export async function clearAllTables(): Promise<void> {
         db.shelves.clear(),
         db.turnings.clear(),
         db.environments.clear(),
-        db.tastings.clear()
+        db.tastings.clear(),
+        db.thresholdVersions.clear()
       ])
     }
   )
+}
+
+/** 读取应用级单例元数据 */
+export async function getAppMeta(): Promise<AppMeta> {
+  const existing = await db.appMeta.get(APP_META_ID)
+  if (existing) return existing
+  const fallback: AppMeta = { id: APP_META_ID, dataVersion: 1, updatedAt: Date.now() }
+  await db.appMeta.put(fallback)
+  return fallback
+}
+
+/**
+ * 数据修订号 +1：阈值发布 / 覆盖导入 / 重置等会让其它标签页已打开表单过期的
+ * 批量变更后调用，跨标签页据此提示「重新载入」。
+ */
+export async function bumpDataVersion(): Promise<number> {
+  return db.transaction('rw', db.appMeta, async () => {
+    const meta = (await db.appMeta.get(APP_META_ID)) ?? {
+      id: APP_META_ID,
+      dataVersion: 0,
+      updatedAt: 0
+    }
+    const next = meta.dataVersion + 1
+    await db.appMeta.put({ id: APP_META_ID, dataVersion: next, updatedAt: Date.now() })
+    return next
+  })
+}
+
+/** 确保初始阈值版本存在（空库播种 / 导入无版本字段的旧备份时兜底） */
+export async function ensureInitialThresholdVersion(): Promise<ThresholdVersion> {
+  const existing = await db.thresholdVersions.get(INITIAL_THRESHOLD_VERSION_ID)
+  if (existing) return existing
+  const now = Date.now()
+  const hasActive = (await db.thresholdVersions.toArray()).some((version) => version.isActive)
+  const version: ThresholdVersion = {
+    ...INITIAL_THRESHOLD_SETTINGS,
+    id: INITIAL_THRESHOLD_VERSION_ID,
+    label: '初始温湿度阈值',
+    effectiveAt: '2025-01-01',
+    isActive: !hasActive,
+    note: '补建的初始阈值版本',
+    createdAt: now,
+    updatedAt: now
+  }
+  await db.thresholdVersions.put(version)
+  return version
 }
 
 /** 重置：清空后重新播种演示数据 */
 export async function resetDatabase(): Promise<void> {
   await clearAllTables()
   await seedDatabase()
+  await bumpDataVersion()
 }
 
 /** 各表记录数统计，供品评页与 README 中的「本地数据概览」展示 */
 export async function countAll(): Promise<Record<string, number>> {
-  const [milks, batches, shelves, turnings, environments, tastings] = await Promise.all([
+  const [milks, batches, shelves, turnings, environments, tastings, thresholdVersions] = await Promise.all([
     db.milks.count(),
     db.batches.count(),
     db.shelves.count(),
     db.turnings.count(),
     db.environments.count(),
-    db.tastings.count()
+    db.tastings.count(),
+    db.thresholdVersions.count()
   ])
-  return { milks, batches, shelves, turnings, environments, tastings }
+  return { milks, batches, shelves, turnings, environments, tastings, thresholdVersions }
 }
 
 /** 读取 localStorage 中的 UI 偏好 */
@@ -234,13 +354,14 @@ export function readLastBackupAt(): string | null {
 
 /** 组装全量导出快照 */
 export async function exportSnapshot(): Promise<BackupPayload> {
-  const [milks, batches, shelves, turnings, environments, tastings] = await Promise.all([
+  const [milks, batches, shelves, turnings, environments, tastings, thresholdVersions] = await Promise.all([
     db.milks.toArray(),
     db.batches.toArray(),
     db.shelves.toArray(),
     db.turnings.toArray(),
     db.environments.toArray(),
-    db.tastings.toArray()
+    db.tastings.toArray(),
+    db.thresholdVersions.toArray()
   ])
   return {
     app: 'gbcheeseage',
@@ -251,7 +372,8 @@ export async function exportSnapshot(): Promise<BackupPayload> {
     shelves,
     turnings,
     environments,
-    tastings
+    tastings,
+    thresholdVersions
   }
 }
 
@@ -263,8 +385,9 @@ export async function importSnapshot(
   if (overwrite) await clearAllTables()
   await db.transaction(
     'rw',
-    [db.milks, db.batches, db.shelves, db.turnings, db.environments, db.tastings],
+    [db.milks, db.batches, db.shelves, db.turnings, db.environments, db.tastings, db.thresholdVersions],
     async () => {
+      await db.thresholdVersions.bulkPut(payload.thresholdVersions)
       await db.milks.bulkPut(payload.milks)
       await db.batches.bulkPut(payload.batches)
       await db.shelves.bulkPut(payload.shelves)
@@ -273,19 +396,26 @@ export async function importSnapshot(
       await db.tastings.bulkPut(payload.tastings)
     }
   )
+  if (overwrite) await bumpDataVersion()
   return {
     milks: payload.milks.length,
     batches: payload.batches.length,
     shelves: payload.shelves.length,
     turnings: payload.turnings.length,
     environments: payload.environments.length,
-    tastings: payload.tastings.length
+    tastings: payload.tastings.length,
+    thresholdVersions: payload.thresholdVersions.length
   }
 }
 
 /** 首屏初始化：打开数据库 → 空库时播种三层演示数据 */
 export async function initDatabase(): Promise<void> {
   await db.open()
+  // 兜底：异常中断（如升级中途退出）后也保证单例元数据与初始阈值版本存在
+  await getAppMeta()
+  if ((await db.thresholdVersions.count()) === 0) {
+    await ensureInitialThresholdVersion()
+  }
   if ((await db.milks.count()) === 0) {
     await seedDatabase()
   }
@@ -299,6 +429,19 @@ const SEED_TIME = Date.UTC(2025, 2, 1, 8, 0, 0)
  */
 export async function seedDatabase(): Promise<void> {
   const now = SEED_TIME
+
+  const thresholdVersions: ThresholdVersion[] = [
+    {
+      ...INITIAL_THRESHOLD_SETTINGS,
+      id: INITIAL_THRESHOLD_VERSION_ID,
+      label: '2025 Q1 初始阈值',
+      effectiveAt: '2025-01-01',
+      isActive: true,
+      note: '全年初始温湿度阈值',
+      createdAt: now,
+      updatedAt: now
+    }
+  ]
 
   const milks: Milk[] = [
     {
@@ -494,6 +637,9 @@ export async function seedDatabase(): Promise<void> {
       recordedAt: '2025-03-03T09:30',
       tempC: 11.5,
       humidityPct: 85,
+      zone: '中温区',
+      thresholdVersionId: INITIAL_THRESHOLD_VERSION_ID,
+      stale: false,
       anomaly: false,
       action: '',
       createdAt: now,
@@ -505,6 +651,9 @@ export async function seedDatabase(): Promise<void> {
       recordedAt: '2025-03-17T09:20',
       tempC: 15.8,
       humidityPct: 79,
+      zone: '中温区',
+      thresholdVersionId: INITIAL_THRESHOLD_VERSION_ID,
+      stale: false,
       anomaly: true,
       action: '开窗通风 30 分钟并开启加湿器至 85%',
       createdAt: now,
@@ -516,6 +665,9 @@ export async function seedDatabase(): Promise<void> {
       recordedAt: '2025-03-11T10:05',
       tempC: 7.2,
       humidityPct: 88,
+      zone: '冷区',
+      thresholdVersionId: INITIAL_THRESHOLD_VERSION_ID,
+      stale: false,
       anomaly: false,
       action: '',
       createdAt: now,
@@ -527,6 +679,9 @@ export async function seedDatabase(): Promise<void> {
       recordedAt: '2025-03-08T14:40',
       tempC: 12.1,
       humidityPct: 90,
+      zone: '中温区',
+      thresholdVersionId: INITIAL_THRESHOLD_VERSION_ID,
+      stale: false,
       anomaly: false,
       action: '',
       createdAt: now,
@@ -587,8 +742,9 @@ export async function seedDatabase(): Promise<void> {
 
   await db.transaction(
     'rw',
-    [db.milks, db.batches, db.shelves, db.turnings, db.environments, db.tastings],
+    [db.milks, db.batches, db.shelves, db.turnings, db.environments, db.tastings, db.thresholdVersions],
     async () => {
+      await db.thresholdVersions.bulkPut(thresholdVersions)
       await db.milks.bulkPut(milks)
       await db.batches.bulkPut(batches)
       await db.shelves.bulkPut(shelves)

@@ -473,11 +473,12 @@ async function resetAll(): Promise<void> {
         <StatBadge label="转架作业" :value="counts.turnings ?? 0" suffix="条" icon="Tickets" size="small" />
         <StatBadge label="环境记录" :value="counts.environments ?? 0" suffix="条" icon="Odometer" size="small" />
         <StatBadge label="品评记录" :value="counts.tastings ?? 0" suffix="条" icon="Star" size="small" />
+        <StatBadge label="阈值版本" :value="counts.thresholdVersions ?? 0" suffix="版" icon="SetUp" size="small" />
       </div>
 
       <el-descriptions :column="2" border class="desc-gap">
         <el-descriptions-item label="数据库名">{{ DB_NAME }}</el-descriptions-item>
-        <el-descriptions-item label="结构版本">v{{ DB_VERSION }}（含 version(2).upgrade 迁移）</el-descriptions-item>
+        <el-descriptions-item label="结构版本">v{{ DB_VERSION }}（含 version(3) 阈值版本化升级）</el-descriptions-item>
         <el-descriptions-item label="最近导出">
           {{ tastingStore.lastBackupAt ? tastingStore.lastBackupAt.slice(0, 19).replace('T', ' ') : '尚未导出' }}
         </el-descriptions-item>
