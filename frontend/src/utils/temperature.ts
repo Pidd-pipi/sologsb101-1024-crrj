@@ -1,15 +1,33 @@
 import type { TempZone } from '@/types/shelf'
+import {
+  DEFAULT_HUMIDITY_RANGE,
+  DEFAULT_TEMP_RANGES,
+  type ThresholdRange,
+  type ThresholdVersion
+} from '@/types/threshold'
 import type { EnvSeriesPoint, Environment } from '@/types/environment'
 
-/** 各温区的适宜温度区间（℃） */
-export const TEMP_RANGE: Record<TempZone, { min: number; max: number }> = {
-  冷区: { min: 4, max: 8 },
-  中温区: { min: 9, max: 13 },
-  常温区: { min: 14, max: 18 }
+/** 各温区的适宜温度区间（℃）——默认阈值，新版本判定以阈值版本快照为准 */
+export const TEMP_RANGE: Record<TempZone, { min: number; max: number }> = DEFAULT_TEMP_RANGES
+
+/** 熟成库适宜湿度区间（%）——默认阈值，新版本判定以阈值版本快照为准 */
+export const HUMIDITY_RANGE = DEFAULT_HUMIDITY_RANGE
+
+/** 判定时使用的区间覆写：不传则回退到默认阈值 */
+export interface RangeOverrides {
+  tempRanges?: Record<TempZone, ThresholdRange>
+  humidity?: ThresholdRange
 }
 
-/** 熟成库适宜湿度区间（%）：低于下限需加湿，高于上限需除湿通风 */
-export const HUMIDITY_RANGE = { min: 80, max: 92 }
+/** 取某温区的温度区间（优先使用阈值版本快照） */
+export function tempRangeOf(zone: TempZone, overrides?: RangeOverrides): ThresholdRange {
+  return overrides?.tempRanges?.[zone] ?? DEFAULT_TEMP_RANGES[zone]
+}
+
+/** 取湿度区间（优先使用阈值版本快照） */
+export function humidityRangeOf(overrides?: RangeOverrides): ThresholdRange {
+  return overrides?.humidity ?? DEFAULT_HUMIDITY_RANGE
+}
 
 /** 温区代表色，用于卡片与曲线 */
 export const ZONE_COLOR: Record<TempZone, string> = {
@@ -51,16 +69,22 @@ function judge(
 }
 
 /**
- * 温区阈值判定：温度按 `zone` 阈值、湿度按 HUMIDITY_RANGE 阈值，
+ * 温区阈值判定（纯函数）：温度按 `zone` 阈值、湿度按湿度区间阈值，
  * 任一越界即 ok = false，并给出开窗 / 加湿等调整建议。
+ * 阈值区间由调用方按记录所属的阈值版本快照传入，历史记录按当时版本判定。
  */
-export function judgeEnvironment(tempC: number, humidityPct: number, zone: TempZone): RangeVerdict {
-  const range = TEMP_RANGE[zone]
-  const tempIssue = judge(tempC, range.min, range.max, '℃', `${zone}温度偏低`, `${zone}温度偏高`)
+export function judgeEnvironmentAt(
+  tempC: number,
+  humidityPct: number,
+  zone: TempZone,
+  tempRange: ThresholdRange,
+  humidityRange: ThresholdRange
+): RangeVerdict {
+  const tempIssue = judge(tempC, tempRange.min, tempRange.max, '℃', `${zone}温度偏低`, `${zone}温度偏高`)
   const humidityIssue = judge(
     humidityPct,
-    HUMIDITY_RANGE.min,
-    HUMIDITY_RANGE.max,
+    humidityRange.min,
+    humidityRange.max,
     '%',
     '湿度过低',
     '湿度过高'
@@ -70,11 +94,13 @@ export function judgeEnvironment(tempC: number, humidityPct: number, zone: TempZ
   const suggestions: string[] = []
   if (tempIssue) {
     reasons.push(tempIssue)
-    suggestions.push(tempC > range.max ? '开窗通风降温或开启制冷' : '关闭新风并开启保温')
+    suggestions.push(tempC > tempRange.max ? '开窗通风降温或开启制冷' : '关闭新风并开启保温')
   }
   if (humidityIssue) {
     reasons.push(humidityIssue)
-    suggestions.push(humidityPct < HUMIDITY_RANGE.min ? '开启加湿器并覆盖湿布' : '开窗排湿或开启除湿机')
+    suggestions.push(
+      humidityPct < humidityRange.min ? '开启加湿器并覆盖湿布' : '开窗排湿或开启除湿机'
+    )
   }
 
   return {
@@ -86,23 +112,62 @@ export function judgeEnvironment(tempC: number, humidityPct: number, zone: TempZ
   }
 }
 
+/**
+ * 温区阈值判定：温度按 `zone` 阈值、湿度按 HUMIDITY_RANGE 阈值，
+ * 任一越界即 ok = false，并给出开窗 / 加湿等调整建议。
+ * 可传入阈值版本快照覆写默认区间；不传时使用默认阈值（兼容旧调用）。
+ */
+export function judgeEnvironment(
+  tempC: number,
+  humidityPct: number,
+  zone: TempZone,
+  overrides?: RangeOverrides
+): RangeVerdict {
+  return judgeEnvironmentAt(
+    tempC,
+    humidityPct,
+    zone,
+    tempRangeOf(zone, overrides),
+    humidityRangeOf(overrides)
+  )
+}
+
 /** 越界自动标异常：任一温湿度越界即为异常 */
-export function isAnomaly(tempC: number, humidityPct: number, zone: TempZone): boolean {
-  return !judgeEnvironment(tempC, humidityPct, zone).ok
+export function isAnomaly(
+  tempC: number,
+  humidityPct: number,
+  zone: TempZone,
+  overrides?: RangeOverrides
+): boolean {
+  return !judgeEnvironment(tempC, humidityPct, zone, overrides).ok
 }
 
 /** 异常记录的默认调整措施文案，写入表单初值 */
-export function suggestAction(tempC: number, humidityPct: number, zone: TempZone): string {
-  const verdict = judgeEnvironment(tempC, humidityPct, zone)
+export function suggestAction(
+  tempC: number,
+  humidityPct: number,
+  zone: TempZone,
+  overrides?: RangeOverrides
+): string {
+  const verdict = judgeEnvironment(tempC, humidityPct, zone, overrides)
   if (verdict.ok) return ''
   return verdict.suggestion
 }
 
-/** 温湿度越界标记换算：按批次所在温区批量判定一组记录 */
-export function markAnomalies(records: Environment[], zoneOf: (batchId: string) => TempZone): number {
+/** 由阈值版本快照构造区间覆写入参 */
+export function overridesOf(version: ThresholdVersion): RangeOverrides {
+  return { tempRanges: version.tempRanges, humidity: version.humidity }
+}
+
+/** 越界标记换算：按批次所在温区与阈值版本批量判定一组记录 */
+export function markAnomalies(
+  records: Environment[],
+  zoneOf: (batchId: string) => TempZone,
+  rangesOf: (record: Environment) => RangeOverrides = () => ({})
+): number {
   let changed = 0
   records.forEach((record) => {
-    const expected = isAnomaly(record.tempC, record.humidityPct, zoneOf(record.batchId))
+    const expected = isAnomaly(record.tempC, record.humidityPct, zoneOf(record.batchId), rangesOf(record))
     if (record.anomaly !== expected) changed += 1
   })
   return changed

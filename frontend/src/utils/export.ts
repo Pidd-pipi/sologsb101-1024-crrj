@@ -3,10 +3,12 @@ import {
   DB_VERSION,
   createId,
   clearAllTables,
+  ensureInitialThresholds,
   stampBackupTime,
   type BackupPayload,
   type BatchArchive
 } from '@/utils/db'
+import type { ThresholdVersion } from '@/types/threshold'
 
 /** 导入 / 校验结果：校验失败时 errors 非空、payload 为 null */
 export interface ParseResult {
@@ -55,7 +57,10 @@ export function validatePayload(input: unknown): ParseResult {
     shelves: (obj.shelves ?? []).filter((item) => typeof item?.id === 'string'),
     turnings: (obj.turnings ?? []).filter((item) => typeof item?.id === 'string'),
     environments: (obj.environments ?? []).filter((item) => typeof item?.id === 'string'),
-    tastings: (obj.tastings ?? []).filter((item) => typeof item?.id === 'string')
+    tastings: (obj.tastings ?? []).filter((item) => typeof item?.id === 'string'),
+    thresholds: Array.isArray(obj.thresholds)
+      ? obj.thresholds.filter((item) => typeof item?.id === 'string')
+      : []
   }
   if (payload.batches.length === 0 && payload.milks.length === 0) {
     errors.push('文件中没有任何奶源或批次记录')
@@ -126,13 +131,14 @@ function stamp(): string {
 
 /** 导出全量档案 JSON */
 export async function exportSnapshotJson(): Promise<{ fileName: string; counts: Record<string, number> }> {
-  const [milks, batches, shelves, turnings, environments, tastings] = await Promise.all([
+  const [milks, batches, shelves, turnings, environments, tastings, thresholds] = await Promise.all([
     db.milks.toArray(),
     db.batches.toArray(),
     db.shelves.toArray(),
     db.turnings.toArray(),
     db.environments.toArray(),
-    db.tastings.toArray()
+    db.tastings.toArray(),
+    db.thresholds.toArray()
   ])
   const payload: BackupPayload = {
     app: 'gbcheeseage',
@@ -143,7 +149,8 @@ export async function exportSnapshotJson(): Promise<{ fileName: string; counts: 
     shelves,
     turnings,
     environments,
-    tastings
+    tastings,
+    thresholds
   }
   const fileName = `gbcheeseage-archive-v${DB_VERSION}-${stamp()}.json`
   downloadJson(fileName, payload)
@@ -156,23 +163,25 @@ export async function exportSnapshotJson(): Promise<{ fileName: string; counts: 
       shelves: shelves.length,
       turnings: turnings.length,
       environments: environments.length,
-      tastings: tastings.length
+      tastings: tastings.length,
+      thresholds: thresholds.length
     }
   }
 }
 
-/** 导出单个批次的熟成档案（含奶源、窖位、转架、环境与品评） */
+/** 导出单个批次的熟成档案（含奶源、窖位、转架、环境、品评与阈值版本） */
 export async function exportBatchArchiveJson(
   batchId: string
 ): Promise<{ fileName: string; counts: Record<string, number> }> {
   const batch = await db.batches.get(batchId)
   if (!batch) throw new Error('批次不存在，无法导出')
-  const [milks, shelves, turnings, environments, tastings] = await Promise.all([
+  const [milks, shelves, turnings, environments, tastings, thresholds] = await Promise.all([
     db.milks.toArray(),
     db.shelves.toArray(),
     db.turnings.where('batchId').equals(batchId).toArray(),
     db.environments.where('batchId').equals(batchId).toArray(),
-    db.tastings.where('batchId').equals(batchId).toArray()
+    db.tastings.where('batchId').equals(batchId).toArray(),
+    db.thresholds.toArray()
   ])
   const archive: BatchArchive = {
     app: 'gbcheeseage',
@@ -185,7 +194,8 @@ export async function exportBatchArchiveJson(
     shelves: shelves.filter((shelf) => shelf.id === batch.shelfId),
     turnings,
     environments,
-    tastings
+    tastings,
+    thresholds
   }
   const fileName = `gbcheeseage-batch-${batchId}-${stamp()}.json`
   downloadJson(fileName, archive)
@@ -197,7 +207,8 @@ export async function exportBatchArchiveJson(
       shelves: archive.shelves.length,
       turnings: turnings.length,
       environments: environments.length,
-      tastings: tastings.length
+      tastings: tastings.length,
+      thresholds: thresholds.length
     }
   }
 }
@@ -210,7 +221,7 @@ export async function importSnapshotJson(
   if (overwrite) await clearAllTables()
   await db.transaction(
     'rw',
-    [db.milks, db.batches, db.shelves, db.turnings, db.environments, db.tastings],
+    [db.milks, db.batches, db.shelves, db.turnings, db.environments, db.tastings, db.thresholds],
     async () => {
       await db.milks.bulkPut(payload.milks)
       await db.batches.bulkPut(payload.batches)
@@ -218,15 +229,18 @@ export async function importSnapshotJson(
       await db.turnings.bulkPut(payload.turnings)
       await db.environments.bulkPut(payload.environments)
       await db.tastings.bulkPut(payload.tastings)
+      await db.thresholds.bulkPut(payload.thresholds)
     }
   )
+  await ensureInitialThresholds()
   return {
     milks: payload.milks.length,
     batches: payload.batches.length,
     shelves: payload.shelves.length,
     turnings: payload.turnings.length,
     environments: payload.environments.length,
-    tastings: payload.tastings.length
+    tastings: payload.tastings.length,
+    thresholds: payload.thresholds.length
   }
 }
 
@@ -235,6 +249,7 @@ export function remapPayloadIds(payload: BackupPayload): BackupPayload {
   const milkIdMap = new Map<string, string>()
   const batchIdMap = new Map<string, string>()
   const shelfIdMap = new Map<string, string>()
+  const thresholdIdMap = new Map<string, string>()
 
   const milks = payload.milks.map((milk) => {
     const id = createId('milk')
@@ -265,13 +280,19 @@ export function remapPayloadIds(payload: BackupPayload): BackupPayload {
   const environments = payload.environments.map((record) => ({
     ...record,
     id: createId('env'),
-    batchId: batchIdMap.get(record.batchId) ?? record.batchId
+    batchId: batchIdMap.get(record.batchId) ?? record.batchId,
+    thresholdVersionId: thresholdIdMap.get(record.thresholdVersionId) ?? record.thresholdVersionId
   }))
   const tastings = payload.tastings.map((tasting) => ({
     ...tasting,
     id: createId('tast'),
     batchId: batchIdMap.get(tasting.batchId) ?? tasting.batchId
   }))
+  const thresholds: ThresholdVersion[] = payload.thresholds.map((version) => {
+    const id = createId('thr')
+    thresholdIdMap.set(version.id, id)
+    return { ...version, id }
+  })
 
-  return { ...payload, milks, batches, shelves, turnings, environments, tastings }
+  return { ...payload, milks, batches, shelves, turnings, environments, tastings, thresholds }
 }

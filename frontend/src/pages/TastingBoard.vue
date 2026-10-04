@@ -13,6 +13,7 @@ import StatBadge from '@/components/common/StatBadge.vue'
 import { useAgingDays } from '@/hooks/useAgingDays'
 import { useMilkStore } from '@/stores/milkStore'
 import { useTastingStore, type TastingRow } from '@/stores/tastingStore'
+import { useEditGuard } from '@/hooks/useEditGuard'
 import {
   SCORE_DIMENSIONS,
   TASTING_CONCLUSIONS,
@@ -26,6 +27,7 @@ import {
   readStampedDbVersion,
   DB_NAME,
   DB_VERSION,
+  db,
   resetDatabase
 } from '@/utils/db'
 import {
@@ -40,6 +42,7 @@ import { toDateString } from '@/utils/temperature'
 
 const tastingStore = useTastingStore()
 const milkStore = useMilkStore()
+const guard = useEditGuard()
 
 const { tastings, filteredRows, ready, filter, batchScores, avgScore, conclusionCounts, pendingBatches } =
   storeToRefs(tastingStore)
@@ -150,6 +153,7 @@ function resetFilter(): void {
 function openDialog(row?: TastingRow): void {
   if (row) {
     editingId.value = row.tasting.id
+    guard.capture(row.tasting.updatedAt)
     form.batchId = row.tasting.batchId
     form.outAt = row.tasting.outAt
     form.appearance = row.tasting.appearance
@@ -161,6 +165,7 @@ function openDialog(row?: TastingRow): void {
     form.taster = row.tasting.taster
   } else {
     editingId.value = null
+    guard.reset()
     form.batchId = batches.value[0]?.id ?? ''
     form.outAt = toDateString(new Date())
     form.appearance = ''
@@ -178,6 +183,7 @@ async function submit(): Promise<void> {
   if (!formRef.value) return
   const valid = await formRef.value.validate().catch(() => false)
   if (!valid) return
+  if (editingId.value && !(await guard.ensureFresh(db.tastings, editingId.value))) return
   if (editingId.value) {
     await tastingStore.updateTasting(editingId.value, { ...form })
     ElMessage.success(`品评已更新，均分 ${formTotal.value} 分（${formConclusion.value}）已回写批次结论`)
@@ -473,6 +479,7 @@ async function resetAll(): Promise<void> {
         <StatBadge label="转架作业" :value="counts.turnings ?? 0" suffix="条" icon="Tickets" size="small" />
         <StatBadge label="环境记录" :value="counts.environments ?? 0" suffix="条" icon="Odometer" size="small" />
         <StatBadge label="品评记录" :value="counts.tastings ?? 0" suffix="条" icon="Star" size="small" />
+        <StatBadge label="阈值版本" :value="counts.thresholds ?? 0" suffix="个" icon="DataLine" size="small" />
       </div>
 
       <el-descriptions :column="2" border class="desc-gap">

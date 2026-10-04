@@ -11,11 +11,14 @@ import FilterBar, {
 import StatBadge from '@/components/common/StatBadge.vue'
 import { useMilkStore } from '@/stores/milkStore'
 import { useShelfStore } from '@/stores/shelfStore'
+import { useEditGuard } from '@/hooks/useEditGuard'
+import { db } from '@/utils/db'
 import { TEMP_ZONES, createEmptyShelfFilter, type Shelf, type TempZone } from '@/types/shelf'
 import { TEMP_RANGE, ZONE_COLOR } from '@/utils/temperature'
 
 const shelfStore = useShelfStore()
 const milkStore = useMilkStore()
+const guard = useEditGuard()
 
 const {
   shelves,
@@ -144,6 +147,7 @@ function resetShelfForm(): void {
 function openShelfDialog(shelf?: Shelf): void {
   if (shelf) {
     editingShelfId.value = shelf.id
+    guard.capture(shelf.updatedAt)
     shelfForm.room = shelf.room
     shelfForm.rackNo = shelf.rackNo
     shelfForm.layerNo = shelf.layerNo
@@ -152,6 +156,7 @@ function openShelfDialog(shelf?: Shelf): void {
     shelfForm.occupied = shelf.occupied
   } else {
     editingShelfId.value = null
+    guard.reset()
     resetShelfForm()
   }
   shelfDialogVisible.value = true
@@ -161,6 +166,7 @@ async function submitShelf(): Promise<void> {
   if (!shelfFormRef.value) return
   const valid = await shelfFormRef.value.validate().catch(() => false)
   if (!valid) return
+  if (editingShelfId.value && !(await guard.ensureFresh(db.shelves, editingShelfId.value))) return
   if (editingShelfId.value) {
     await shelfStore.updateShelf(editingShelfId.value, { ...shelfForm })
     ElMessage.success('窖位已更新')

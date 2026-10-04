@@ -6,13 +6,15 @@ export interface Environment {
   id: string
   /** 所属批次 id（外键 → Batch.id） */
   batchId: string
+  /** 判定时依据的阈值版本 id（外键 → ThresholdVersion.id），异常结论随版本封存 */
+  thresholdVersionId: string
   /** 记录时间（YYYY-MM-DDTHH:mm） */
   recordedAt: string
   /** 温度 ℃ */
   tempC: number
   /** 湿度 % */
   humidityPct: number
-  /** 是否异常（越界自动判定，也可人工修正） */
+  /** 是否异常（按所属阈值版本的区间自动判定，也可人工修正） */
   anomaly: boolean
   /** 调整措施，如「开窗通风 30 分钟」「加湿至 88%」 */
   action: string

@@ -13,6 +13,8 @@ import StatBadge from '@/components/common/StatBadge.vue'
 import { useAgingDays } from '@/hooks/useAgingDays'
 import { useMilkStore } from '@/stores/milkStore'
 import { useShelfStore } from '@/stores/shelfStore'
+import { useEditGuard } from '@/hooks/useEditGuard'
+import { db } from '@/utils/db'
 import {
   BATCH_STATES,
   CHEESE_TYPES,
@@ -26,6 +28,8 @@ import { toDateString } from '@/utils/temperature'
 
 const milkStore = useMilkStore()
 const shelfStore = useShelfStore()
+const milkGuard = useEditGuard()
+const batchGuard = useEditGuard()
 
 const { milks, batches, ready, filter, milkStatMap, overview } = storeToRefs(milkStore)
 const { occupancyPercent } = storeToRefs(shelfStore)
@@ -189,6 +193,7 @@ function resetMilkForm(): void {
 function openMilkDialog(milk?: Milk): void {
   if (milk) {
     editingMilkId.value = milk.id
+    milkGuard.capture(milk.updatedAt)
     milkForm.farm = milk.farm
     milkForm.milkKind = milk.milkKind
     milkForm.collectedAt = milk.collectedAt
@@ -197,6 +202,7 @@ function openMilkDialog(milk?: Milk): void {
     milkForm.note = milk.note
   } else {
     editingMilkId.value = null
+    milkGuard.reset()
     resetMilkForm()
   }
   milkDialogVisible.value = true
@@ -206,6 +212,7 @@ async function submitMilk(): Promise<void> {
   if (!milkFormRef.value) return
   const valid = await milkFormRef.value.validate().catch(() => false)
   if (!valid) return
+  if (editingMilkId.value && !(await milkGuard.ensureFresh(db.milks, editingMilkId.value))) return
   if (editingMilkId.value) {
     await milkStore.updateMilk(editingMilkId.value, { ...milkForm })
     ElMessage.success('奶源已更新')
@@ -229,6 +236,7 @@ function resetBatchForm(): void {
 function openBatchDialog(batch?: Batch, milkId?: string): void {
   if (batch) {
     editingBatchId.value = batch.id
+    batchGuard.capture(batch.updatedAt)
     batchForm.milkId = batch.milkId
     batchForm.curdedAt = batch.curdedAt
     batchForm.cheeseType = batch.cheeseType
@@ -237,6 +245,7 @@ function openBatchDialog(batch?: Batch, milkId?: string): void {
     batchForm.state = batch.state
   } else {
     editingBatchId.value = null
+    batchGuard.reset()
     resetBatchForm()
     if (milkId) batchForm.milkId = milkId
   }
@@ -250,6 +259,7 @@ async function submitBatch(): Promise<void> {
   if (!batchFormRef.value) return
   const valid = await batchFormRef.value.validate().catch(() => false)
   if (!valid) return
+  if (editingBatchId.value && !(await batchGuard.ensureFresh(db.batches, editingBatchId.value))) return
   if (editingBatchId.value) {
     await milkStore.updateBatch(editingBatchId.value, { ...batchForm })
     ElMessage.success('生产批次已更新，最早可出库日期已重算')

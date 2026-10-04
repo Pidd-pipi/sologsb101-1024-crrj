@@ -22,6 +22,8 @@ import StatBadge from '@/components/common/StatBadge.vue'
 import { useMilkStore } from '@/stores/milkStore'
 import { useShelfStore } from '@/stores/shelfStore'
 import { useTurningStore, type TurningRow } from '@/stores/turningStore'
+import { useEditGuard } from '@/hooks/useEditGuard'
+import { db } from '@/utils/db'
 import {
   TURNING_STATES,
   TURNING_TYPES,
@@ -35,6 +37,7 @@ import { addDays, toDateString } from '@/utils/temperature'
 const turningStore = useTurningStore()
 const milkStore = useMilkStore()
 const shelfStore = useShelfStore()
+const guard = useEditGuard()
 
 const { filteredRows, groupedRows, ready, filter, summary, todayRows, overdueRows, sortMode } =
   storeToRefs(turningStore)
@@ -163,6 +166,7 @@ function resetTurningForm(): void {
 function openTurningDialog(row?: TurningRow): void {
   if (row) {
     editingTurningId.value = row.turning.id
+    guard.capture(row.turning.updatedAt)
     turningForm.batchId = row.turning.batchId
     turningForm.shelfId = row.turning.shelfId
     turningForm.doneAt = row.turning.doneAt
@@ -172,6 +176,7 @@ function openTurningDialog(row?: TurningRow): void {
     turningForm.state = row.turning.state
   } else {
     editingTurningId.value = null
+    guard.reset()
     resetTurningForm()
   }
   turningDialogVisible.value = true
@@ -181,6 +186,7 @@ async function submitTurning(): Promise<void> {
   if (!turningFormRef.value) return
   const valid = await turningFormRef.value.validate().catch(() => false)
   if (!valid) return
+  if (editingTurningId.value && !(await guard.ensureFresh(db.turnings, editingTurningId.value))) return
   if (editingTurningId.value) {
     await turningStore.updateTurning(editingTurningId.value, { ...turningForm })
     ElMessage.success('转架作业已更新')

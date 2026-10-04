@@ -5,13 +5,15 @@ import type { Shelf } from '@/types/shelf'
 import type { Turning } from '@/types/turning'
 import type { Environment } from '@/types/environment'
 import type { Tasting } from '@/types/tasting'
+import type { ThresholdVersion } from '@/types/threshold'
+import { createInitialThresholdVersion, INITIAL_THRESHOLD_ID } from '@/types/threshold'
 import { addDays, diffDays } from '@/utils/temperature'
 
 /** IndexedDB 数据库名：与项目英文短名保持一致 */
 export const DB_NAME = 'gbcheeseage'
 
 /** 本地结构版本号：新增/修改表结构时必须递增，并补充 upgrade 迁移 */
-export const DB_VERSION = 2
+export const DB_VERSION = 3
 
 /** localStorage 键名（仅存少量元数据，业务数据一律在 IndexedDB） */
 export const LS_KEYS = {
@@ -46,9 +48,10 @@ export interface BackupPayload {
   turnings: Turning[]
   environments: Environment[]
   tastings: Tasting[]
+  thresholds: ThresholdVersion[]
 }
 
-/** 导出的批次熟成档案：含批次、奶源、窖位与全部子记录 */
+/** 导出的批次熟成档案：含批次、奶源、窖位、阈值版本与全部子记录 */
 export interface BatchArchive {
   app: 'gbcheeseage'
   dbVersion: number
@@ -61,6 +64,7 @@ export interface BatchArchive {
   turnings: Turning[]
   environments: Environment[]
   tastings: Tasting[]
+  thresholds: ThresholdVersion[]
 }
 
 export class CheeseAgeDatabase extends Dexie {
@@ -70,6 +74,7 @@ export class CheeseAgeDatabase extends Dexie {
   turnings!: Table<Turning, string>
   environments!: Table<Environment, string>
   tastings!: Table<Tasting, string>
+  thresholds!: Table<ThresholdVersion, string>
 
   constructor() {
     super(DB_NAME)
@@ -83,7 +88,7 @@ export class CheeseAgeDatabase extends Dexie {
       tastings: 'id, batchId, outAt, score, conclusion, updatedAt'
     })
     // v2：批次补 shelfId 索引与 conclusion 字段；转架表补 seq 排序索引；环境表补温区越界阈值快照
-    this.version(DB_VERSION)
+    this.version(2)
       .stores({
         milks: 'id, farm, milkKind, collectedAt, updatedAt',
         batches: 'id, milkId, shelfId, cheeseType, targetDays, state, curdedAt, updatedAt',
@@ -143,6 +148,35 @@ export class CheeseAgeDatabase extends Dexie {
             if (!Number.isFinite(shelf.occupied) || shelf.occupied < 0) shelf.occupied = 0
           })
       })
+    // v3：新增阈值版本表；旧数据升级时补初始阈值版本，并把历史环境记录归属到该版本
+    this.version(DB_VERSION)
+      .stores({
+        milks: 'id, farm, milkKind, collectedAt, updatedAt',
+        batches: 'id, milkId, shelfId, cheeseType, targetDays, state, curdedAt, updatedAt',
+        shelves: 'id, room, rackNo, tempZone, capacity, occupied, updatedAt',
+        turnings: 'id, batchId, shelfId, doneAt, type, state, seq, updatedAt',
+        environments: 'id, batchId, recordedAt, anomaly, updatedAt',
+        tastings: 'id, batchId, outAt, score, conclusion, updatedAt',
+        thresholds: 'id, version, effectiveAt, updatedAt'
+      })
+      .upgrade(async (tx) => {
+        const now = Date.now()
+        // 迁移 5：补初始阈值版本（v1），生效日期取最早环境记录日期（无记录时取 2025-01-01）
+        const envRecords = await tx.table<Environment>('environments').toArray()
+        const earliest = envRecords
+          .map((record) => record.recordedAt.slice(0, 10))
+          .sort()[0]
+        const initial = createInitialThresholdVersion(now)
+        if (earliest) initial.effectiveAt = earliest
+        await tx.table<ThresholdVersion>('thresholds').put(initial)
+        // 迁移 6：历史环境记录归属到初始阈值版本，保留原异常结论
+        await tx
+          .table<Environment>('environments')
+          .toCollection()
+          .modify((record) => {
+            if (!record.thresholdVersionId) record.thresholdVersionId = INITIAL_THRESHOLD_ID
+          })
+      })
   }
 }
 
@@ -158,7 +192,7 @@ export function createId(prefix: string): string {
 export async function clearAllTables(): Promise<void> {
   await db.transaction(
     'rw',
-    [db.milks, db.batches, db.shelves, db.turnings, db.environments, db.tastings],
+    [db.milks, db.batches, db.shelves, db.turnings, db.environments, db.tastings, db.thresholds],
     async () => {
       await Promise.all([
         db.milks.clear(),
@@ -166,7 +200,8 @@ export async function clearAllTables(): Promise<void> {
         db.shelves.clear(),
         db.turnings.clear(),
         db.environments.clear(),
-        db.tastings.clear()
+        db.tastings.clear(),
+        db.thresholds.clear()
       ])
     }
   )
@@ -180,15 +215,16 @@ export async function resetDatabase(): Promise<void> {
 
 /** 各表记录数统计，供品评页与 README 中的「本地数据概览」展示 */
 export async function countAll(): Promise<Record<string, number>> {
-  const [milks, batches, shelves, turnings, environments, tastings] = await Promise.all([
+  const [milks, batches, shelves, turnings, environments, tastings, thresholds] = await Promise.all([
     db.milks.count(),
     db.batches.count(),
     db.shelves.count(),
     db.turnings.count(),
     db.environments.count(),
-    db.tastings.count()
+    db.tastings.count(),
+    db.thresholds.count()
   ])
-  return { milks, batches, shelves, turnings, environments, tastings }
+  return { milks, batches, shelves, turnings, environments, tastings, thresholds }
 }
 
 /** 读取 localStorage 中的 UI 偏好 */
@@ -234,13 +270,14 @@ export function readLastBackupAt(): string | null {
 
 /** 组装全量导出快照 */
 export async function exportSnapshot(): Promise<BackupPayload> {
-  const [milks, batches, shelves, turnings, environments, tastings] = await Promise.all([
+  const [milks, batches, shelves, turnings, environments, tastings, thresholds] = await Promise.all([
     db.milks.toArray(),
     db.batches.toArray(),
     db.shelves.toArray(),
     db.turnings.toArray(),
     db.environments.toArray(),
-    db.tastings.toArray()
+    db.tastings.toArray(),
+    db.thresholds.toArray()
   ])
   return {
     app: 'gbcheeseage',
@@ -251,7 +288,8 @@ export async function exportSnapshot(): Promise<BackupPayload> {
     shelves,
     turnings,
     environments,
-    tastings
+    tastings,
+    thresholds
   }
 }
 
@@ -263,7 +301,7 @@ export async function importSnapshot(
   if (overwrite) await clearAllTables()
   await db.transaction(
     'rw',
-    [db.milks, db.batches, db.shelves, db.turnings, db.environments, db.tastings],
+    [db.milks, db.batches, db.shelves, db.turnings, db.environments, db.tastings, db.thresholds],
     async () => {
       await db.milks.bulkPut(payload.milks)
       await db.batches.bulkPut(payload.batches)
@@ -271,16 +309,41 @@ export async function importSnapshot(
       await db.turnings.bulkPut(payload.turnings)
       await db.environments.bulkPut(payload.environments)
       await db.tastings.bulkPut(payload.tastings)
+      await db.thresholds.bulkPut(payload.thresholds)
     }
   )
+  await ensureInitialThresholds()
   return {
     milks: payload.milks.length,
     batches: payload.batches.length,
     shelves: payload.shelves.length,
     turnings: payload.turnings.length,
     environments: payload.environments.length,
-    tastings: payload.tastings.length
+    tastings: payload.tastings.length,
+    thresholds: payload.thresholds.length
   }
+}
+
+/**
+ * 导入旧版档案（无阈值版本）后补齐初始阈值版本，
+ * 并把缺少 thresholdVersionId 的环境记录回填到初始版本。
+ */
+export async function ensureInitialThresholds(): Promise<void> {
+  const count = await db.thresholds.count()
+  if (count === 0) {
+    const now = Date.now()
+    const earliest = (await db.environments.toArray())
+      .map((record) => record.recordedAt.slice(0, 10))
+      .sort()[0]
+    const initial = createInitialThresholdVersion(now)
+    if (earliest) initial.effectiveAt = earliest
+    await db.thresholds.put(initial)
+  }
+  const versions = await db.thresholds.toArray()
+  const initialId = versions.sort((a, b) => a.version - b.version)[0]?.id ?? INITIAL_THRESHOLD_ID
+  await db.environments
+    .filter((record) => !record.thresholdVersionId)
+    .modify({ thresholdVersionId: initialId })
 }
 
 /** 首屏初始化：打开数据库 → 空库时播种三层演示数据 */
@@ -491,6 +554,7 @@ export async function seedDatabase(): Promise<void> {
     {
       id: 'env_a1',
       batchId: batchAId,
+      thresholdVersionId: INITIAL_THRESHOLD_ID,
       recordedAt: '2025-03-03T09:30',
       tempC: 11.5,
       humidityPct: 85,
@@ -502,6 +566,7 @@ export async function seedDatabase(): Promise<void> {
     {
       id: 'env_a2',
       batchId: batchAId,
+      thresholdVersionId: INITIAL_THRESHOLD_ID,
       recordedAt: '2025-03-17T09:20',
       tempC: 15.8,
       humidityPct: 79,
@@ -513,6 +578,7 @@ export async function seedDatabase(): Promise<void> {
     {
       id: 'env_b1',
       batchId: batchBId,
+      thresholdVersionId: INITIAL_THRESHOLD_ID,
       recordedAt: '2025-03-11T10:05',
       tempC: 7.2,
       humidityPct: 88,
@@ -524,6 +590,7 @@ export async function seedDatabase(): Promise<void> {
     {
       id: 'env_c1',
       batchId: batchCId,
+      thresholdVersionId: INITIAL_THRESHOLD_ID,
       recordedAt: '2025-03-08T14:40',
       tempC: 12.1,
       humidityPct: 90,
@@ -585,9 +652,11 @@ export async function seedDatabase(): Promise<void> {
     }
   ]
 
+  const thresholdV1 = createInitialThresholdVersion(now)
+
   await db.transaction(
     'rw',
-    [db.milks, db.batches, db.shelves, db.turnings, db.environments, db.tastings],
+    [db.milks, db.batches, db.shelves, db.turnings, db.environments, db.tastings, db.thresholds],
     async () => {
       await db.milks.bulkPut(milks)
       await db.batches.bulkPut(batches)
@@ -595,6 +664,7 @@ export async function seedDatabase(): Promise<void> {
       await db.turnings.bulkPut(turnings)
       await db.environments.bulkPut(environments)
       await db.tastings.bulkPut(tastings)
+      await db.thresholds.bulkPut([thresholdV1])
     }
   )
 }

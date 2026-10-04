@@ -12,6 +12,8 @@ import FilterBar, {
 import StatBadge from '@/components/common/StatBadge.vue'
 import { useMilkStore } from '@/stores/milkStore'
 import { useShelfStore } from '@/stores/shelfStore'
+import { useThresholdStore } from '@/stores/thresholdStore'
+import { useEditGuard } from '@/hooks/useEditGuard'
 import { db, createId } from '@/utils/db'
 import {
   HUMIDITY_RANGE,
@@ -21,16 +23,24 @@ import {
   avgHumidity,
   avgTemp,
   judgeEnvironment,
+  overridesOf,
   toPolyline,
   toSeriesPoints
 } from '@/utils/temperature'
+import {
+  createEmptyThresholdForm,
+  thresholdLabel,
+  type ThresholdFormState
+} from '@/types/threshold'
 import type { Environment, EnvironmentFilterState } from '@/types/environment'
 import type { TempZone } from '@/types/shelf'
 
 const milkStore = useMilkStore()
 const shelfStore = useShelfStore()
+const thresholdStore = useThresholdStore()
 const { batches } = storeToRefs(milkStore)
 const { shelves } = storeToRefs(shelfStore)
+const { versions: thresholdVersions, currentVersion } = storeToRefs(thresholdStore)
 
 const records = ref<Environment[]>([])
 const loading = ref(true)
@@ -42,6 +52,7 @@ const dialogVisible = ref(false)
 const editingId = ref<string | null>(null)
 const formRef = ref<FormInstance>()
 const subscription = ref<{ unsubscribe: () => void } | null>(null)
+const guard = useEditGuard()
 
 const form = reactive({
   batchId: '',
@@ -56,6 +67,14 @@ const rules: FormRules = {
   recordedAt: [{ required: true, message: '请选择记录时间', trigger: 'change' }],
   tempC: [{ required: true, message: '请填写温度', trigger: 'blur' }],
   humidityPct: [{ required: true, message: '请填写湿度', trigger: 'blur' }]
+}
+
+/** 阈值版本管理对话框 */
+const thresholdDialogVisible = ref(false)
+const thresholdFormRef = ref<FormInstance>()
+const thresholdForm = reactive<ThresholdFormState>(createEmptyThresholdForm())
+const thresholdRules: FormRules = {
+  effectiveAt: [{ required: true, message: '请选择生效日期', trigger: 'change' }]
 }
 
 function nowLocal(): string {
@@ -173,9 +192,18 @@ const envSelects = computed<FilterSelectConfig[]>(() => [
   }
 ])
 
-/** 表单内实时越界判定与调整建议 */
-const preview = computed(() => judgeEnvironment(form.tempC, form.humidityPct, zoneOf(form.batchId)))
+/** 表单内实时越界判定与调整建议：按记录时间所属阈值版本判定 */
+const preview = computed(() =>
+  judgeEnvironment(
+    form.tempC,
+    form.humidityPct,
+    zoneOf(form.batchId),
+    thresholdStore.rangesAt(form.recordedAt)
+  )
+)
 const previewZone = computed(() => zoneOf(form.batchId))
+/** 表单内记录时间所属的阈值版本（新记录按当时版本判定） */
+const previewVersion = computed(() => thresholdStore.versionAt(form.recordedAt))
 
 function applyFilter(model: FilterModel): void {
   filter.value = {
@@ -193,6 +221,7 @@ function resetFilter(): void {
 function openDialog(record?: Environment): void {
   if (record) {
     editingId.value = record.id
+    guard.capture(record.updatedAt)
     form.batchId = record.batchId
     form.recordedAt = record.recordedAt
     form.tempC = record.tempC
@@ -200,6 +229,7 @@ function openDialog(record?: Environment): void {
     form.action = record.action
   } else {
     editingId.value = null
+    guard.reset()
     form.batchId = batches.value[0]?.id ?? ''
     form.recordedAt = nowLocal()
     form.tempC = 12
@@ -213,13 +243,16 @@ async function submit(): Promise<void> {
   if (!formRef.value) return
   const valid = await formRef.value.validate().catch(() => false)
   if (!valid) return
+  if (editingId.value && !(await guard.ensureFresh(db.environments, editingId.value))) return
   const zone = zoneOf(form.batchId)
-  const verdict = judgeEnvironment(form.tempC, form.humidityPct, zone)
+  const version = thresholdStore.versionAt(form.recordedAt)
+  const verdict = judgeEnvironment(form.tempC, form.humidityPct, zone, overridesOf(version))
   const action = form.action.trim().length > 0 ? form.action.trim() : verdict.ok ? '' : verdict.suggestion
   const now = Date.now()
   const record: Environment = {
     id: editingId.value ?? createId('env'),
     batchId: form.batchId,
+    thresholdVersionId: version.id,
     recordedAt: form.recordedAt,
     tempC: form.tempC,
     humidityPct: form.humidityPct,
@@ -256,25 +289,59 @@ async function remove(record: Environment): Promise<void> {
   ElMessage.success('环境记录已删除')
 }
 
-/** 一键重算全部记录的越界标记 */
+/** 按各记录所属阈值版本重算异常标记（版本变化后相关结论失效并重算） */
 async function remarkAnomalies(): Promise<void> {
-  const all = await db.environments.toArray()
-  let changed = 0
-  const now = Date.now()
-  await db.transaction('rw', db.environments, async () => {
-    for (const record of all) {
-      const verdict = judgeEnvironment(record.tempC, record.humidityPct, zoneOf(record.batchId))
-      if (record.anomaly !== !verdict.ok) {
-        await db.environments.update(record.id, {
-          anomaly: !verdict.ok,
-          action: record.action || verdict.suggestion,
-          updatedAt: now
-        })
-        changed += 1
-      }
-    }
-  })
-  ElMessage.success(changed === 0 ? '全部记录标记已是最新' : `已按温区阈值重算 ${changed} 条记录`)
+  const changed = await thresholdStore.recalcAll()
+  ElMessage.success(
+    changed === 0 ? '全部记录均按所属阈值版本判定，结论无需调整' : `已按记录所属阈值版本重算 ${changed} 条记录的异常结论`
+  )
+}
+
+/** 打开阈值版本管理对话框 */
+function openThresholdDialog(): void {
+  const current = thresholdStore.currentVersion
+  thresholdForm.effectiveAt = ''
+  thresholdForm.note = ''
+  thresholdForm.tempRanges = {
+    冷区: { ...current.tempRanges.冷区 },
+    中温区: { ...current.tempRanges.中温区 },
+    常温区: { ...current.tempRanges.常温区 }
+  }
+  thresholdForm.humidity = { ...current.humidity }
+  thresholdDialogVisible.value = true
+}
+
+/** 保存新阈值版本：保存后重算受影响记录的异常结论 */
+async function submitThreshold(): Promise<void> {
+  if (!thresholdFormRef.value) return
+  const valid = await thresholdFormRef.value.validate().catch(() => false)
+  if (!valid) return
+  try {
+    const result = await thresholdStore.createVersion({ ...thresholdForm })
+    ElMessage.success(
+      `已保存阈值版本 v${result.version.version}（${result.version.effectiveAt} 起生效），重算 ${result.recalculated} 条记录的异常结论`
+    )
+    thresholdDialogVisible.value = false
+  } catch (err) {
+    ElMessage.error(err instanceof Error ? err.message : '阈值版本保存失败')
+  }
+}
+
+/** 记录所属阈值版本标签 */
+function versionTagOf(record: Environment): string {
+  const version = thresholdVersions.value.find((item) => item.id === record.thresholdVersionId)
+  return thresholdLabel(version)
+}
+
+/** 按记录所属阈值版本判定越界原因（历史记录按当时版本，不随新版本改变） */
+function verdictMessageOf(record: Environment): string {
+  const version = thresholdVersions.value.find((item) => item.id === record.thresholdVersionId)
+  return judgeEnvironment(
+    record.tempC,
+    record.humidityPct,
+    zoneOf(record.batchId),
+    version ? overridesOf(version) : undefined
+  ).message
 }
 
 function zoneTextOf(batchId: string): string {
@@ -290,15 +357,47 @@ function zoneTextOf(batchId: string): string {
       <div>
         <h2>熟成库温湿度记录</h2>
         <p>
-          温区阈值：冷区 {{ TEMP_RANGE['冷区'].min }}-{{ TEMP_RANGE['冷区'].max }}℃ · 中温区
-          {{ TEMP_RANGE['中温区'].min }}-{{ TEMP_RANGE['中温区'].max }}℃ · 常温区
-          {{ TEMP_RANGE['常温区'].min }}-{{ TEMP_RANGE['常温区'].max }}℃，湿度
-          {{ HUMIDITY_RANGE.min }}-{{ HUMIDITY_RANGE.max }}%。
+          当前阈值版本 v{{ currentVersion.version }}（{{ currentVersion.effectiveAt }} 起生效）：冷区
+          {{ currentVersion.tempRanges['冷区'].min }}-{{ currentVersion.tempRanges['冷区'].max }}℃ · 中温区
+          {{ currentVersion.tempRanges['中温区'].min }}-{{ currentVersion.tempRanges['中温区'].max }}℃ · 常温区
+          {{ currentVersion.tempRanges['常温区'].min }}-{{ currentVersion.tempRanges['常温区'].max }}℃，湿度
+          {{ currentVersion.humidity.min }}-{{ currentVersion.humidity.max }}%。历史记录按其记录时间所属版本判定，不随新版本重判。
         </p>
       </div>
       <div>
         <el-button type="primary" :icon="Plus" @click="openDialog()">新增记录</el-button>
-        <el-button :icon="DataLine" @click="remarkAnomalies">重算异常标记</el-button>
+        <el-button :icon="DataLine" @click="remarkAnomalies">按版本重算</el-button>
+        <el-button :icon="Edit" @click="openThresholdDialog()">季度阈值调整</el-button>
+      </div>
+    </div>
+
+    <div class="section-card threshold-card">
+      <div class="section-card__head">
+        <h3>阈值版本（{{ thresholdVersions.length }}）</h3>
+        <span class="muted">每季度调整阈值时保存新版本，新记录按当时版本判定，旧记录保留原异常结论</span>
+      </div>
+      <div class="threshold-list">
+        <div
+          v-for="version in thresholdVersions"
+          :key="version.id"
+          class="threshold-chip"
+          :class="{ 'is-current': version.id === currentVersion.id }"
+        >
+          <div class="threshold-chip__head">
+            <el-tag size="small" :type="version.id === currentVersion.id ? 'primary' : 'info'" effect="dark">
+              v{{ version.version }}
+            </el-tag>
+            <span class="mono">{{ version.effectiveAt }}</span>
+            <el-tag v-if="version.id === currentVersion.id" size="small" type="success" effect="plain">当前</el-tag>
+          </div>
+          <p class="threshold-chip__note">{{ version.note }}</p>
+          <p class="threshold-chip__ranges">
+            冷区 {{ version.tempRanges['冷区'].min }}-{{ version.tempRanges['冷区'].max }}℃ · 中温区
+            {{ version.tempRanges['中温区'].min }}-{{ version.tempRanges['中温区'].max }}℃ · 常温区
+            {{ version.tempRanges['常温区'].min }}-{{ version.tempRanges['常温区'].max }}℃ · 湿度
+            {{ version.humidity.min }}-{{ version.humidity.max }}%
+          </p>
+        </div>
       </div>
     </div>
 
@@ -413,7 +512,7 @@ function zoneTextOf(batchId: string): string {
         </el-table-column>
         <el-table-column label="越界原因" min-width="220">
           <template #default="{ row }">
-            {{ judgeEnvironment(row.tempC, row.humidityPct, zoneOf(row.batchId)).message }}
+            {{ verdictMessageOf(row) }}
           </template>
         </el-table-column>
         <el-table-column prop="action" label="调整措施" min-width="200" show-overflow-tooltip />
@@ -435,6 +534,11 @@ function zoneTextOf(batchId: string): string {
       />
       <el-table v-else :data="filteredRecords" border stripe>
         <el-table-column prop="recordedAt" label="记录时间" width="170" />
+        <el-table-column label="阈值版本" width="130">
+          <template #default="{ row }">
+            <el-tag size="small" type="info" effect="plain">{{ versionTagOf(row) }}</el-tag>
+          </template>
+        </el-table-column>
         <el-table-column label="批次" min-width="210">
           <template #default="{ row }">{{ batchLabelOf(row.batchId) }}</template>
         </el-table-column>
@@ -515,16 +619,73 @@ function zoneTextOf(batchId: string): string {
           show-icon
         >
           <template v-if="preview.ok">
-            {{ previewZone }} 温湿度正常（{{ form.tempC }}℃ / {{ form.humidityPct }}%），保存后标记为正常。
+            {{ previewZone }} 温湿度正常（{{ form.tempC }}℃ / {{ form.humidityPct }}%），按 {{ thresholdLabel(previewVersion) }} 判定，保存后标记为正常。
           </template>
           <template v-else>
-            越界：{{ preview.message }} → 自动标异常，建议措施：{{ preview.suggestion }}
+            越界：{{ preview.message }} → 按 {{ thresholdLabel(previewVersion) }} 自动标异常，建议措施：{{ preview.suggestion }}
           </template>
         </el-alert>
       </el-form>
       <template #footer>
         <el-button @click="dialogVisible = false">取消</el-button>
         <el-button type="primary" @click="submit">保存</el-button>
+      </template>
+    </el-dialog>
+
+    <el-dialog
+      v-model="thresholdDialogVisible"
+      :title="`季度阈值调整（将保存为 v${currentVersion.version + 1}）`"
+      width="640px"
+      destroy-on-close
+    >
+      <el-form ref="thresholdFormRef" :model="thresholdForm" :rules="thresholdRules" label-width="120px">
+        <el-form-item label="生效日期" prop="effectiveAt">
+          <el-date-picker
+            v-model="thresholdForm.effectiveAt"
+            type="date"
+            value-format="YYYY-MM-DD"
+            placeholder="选择生效日期"
+            style="width: 100%"
+          />
+        </el-form-item>
+        <el-form-item label="版本说明">
+          <el-input v-model="thresholdForm.note" placeholder="如：2025 年第三季度阈值调整" clearable />
+        </el-form-item>
+        <el-divider content-position="left">温度区间 ℃</el-divider>
+        <el-form-item v-for="zone in ['冷区', '中温区', '常温区']" :key="zone" :label="zone">
+          <div class="range-row">
+            <el-input-number
+              v-model="thresholdForm.tempRanges[zone as TempZone].min"
+              :min="-20"
+              :max="40"
+              :step="0.5"
+              size="small"
+            />
+            <span class="muted">至</span>
+            <el-input-number
+              v-model="thresholdForm.tempRanges[zone as TempZone].max"
+              :min="-20"
+              :max="40"
+              :step="0.5"
+              size="small"
+            />
+          </div>
+        </el-form-item>
+        <el-divider content-position="left">湿度区间 %</el-divider>
+        <el-form-item label="湿度">
+          <div class="range-row">
+            <el-input-number v-model="thresholdForm.humidity.min" :min="0" :max="100" :step="1" size="small" />
+            <span class="muted">至</span>
+            <el-input-number v-model="thresholdForm.humidity.max" :min="0" :max="100" :step="1" size="small" />
+          </div>
+        </el-form-item>
+        <el-alert type="warning" :closable="false" show-icon>
+          保存后，记录时间 ≥ 生效日期的记录按新版本判定，更早的记录保留原结论；受影响记录的异常结论会自动重算。
+        </el-alert>
+      </el-form>
+      <template #footer>
+        <el-button @click="thresholdDialogVisible = false">取消</el-button>
+        <el-button type="primary" @click="submitThreshold">保存新版本</el-button>
       </template>
     </el-dialog>
   </section>
@@ -574,5 +735,52 @@ function zoneTextOf(batchId: string): string {
   margin-top: 6px;
   color: #8c8479;
   font-size: 11px;
+}
+
+.threshold-card {
+  margin-bottom: 16px;
+}
+
+.threshold-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.threshold-chip {
+  padding: 10px 12px;
+  border: 1px solid #e7dfd0;
+  border-left: 4px solid #c9922f;
+  border-radius: 8px;
+  background: #fffdf8;
+}
+
+.threshold-chip.is-current {
+  border-left-color: #1e8449;
+  background: #f4faf5;
+}
+
+.threshold-chip__head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.threshold-chip__note {
+  margin: 6px 0 2px;
+  font-size: 13px;
+  color: #4a433a;
+}
+
+.threshold-chip__ranges {
+  margin: 0;
+  font-size: 12px;
+  color: #8c8479;
+}
+
+.range-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 </style>

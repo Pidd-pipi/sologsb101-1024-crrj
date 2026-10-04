@@ -202,7 +202,7 @@ export const useShelfStore = defineStore('shelf', () => {
 
     const previousShelfId = batch.shelfId
     const now = Date.now()
-    await db.transaction('rw', [db.shelves, db.batches], async () => {
+    await db.transaction('rw', [db.shelves, db.batches, db.turnings], async () => {
       if (previousShelfId) {
         const previous = await db.shelves.get(previousShelfId)
         if (previous) {
@@ -227,6 +227,13 @@ export const useShelfStore = defineStore('shelf', () => {
         state: batch.state === '凝乳' ? '熟成中' : batch.state,
         updatedAt: now
       })
+      // 批次迁移到新窖位：未完成（待执行）转架作业改指新窖位，
+      // 已完成 / 已跳过作业保留原作业位置不动。
+      await db.turnings
+        .where('batchId')
+        .equals(batchId)
+        .and((turning) => turning.state === '待执行')
+        .modify({ shelfId, updatedAt: now })
     })
 
     return {
